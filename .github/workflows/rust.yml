@@ -1,14 +1,21 @@
+name: Rust
+
 on:
-  pull_request:
   push:
-    branches: [main]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: DeterminateSystems/determinate-nix-action@main
-      - run: nix develop --command cargo build --verbose
-      - run: nix develop --command cargo clippy --verbose
-      - run: nix develop --command cargo test --verbose
+    - uses: actions/checkout@v7
+    - name: Build
+      run: cargo build --verbose
+    - name: Clippy
+      run: cargo clippy --verbose
+    - name: Tests
+      run: cargo test --verbose
