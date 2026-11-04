@@ -20,20 +20,22 @@
       forEachSystem = f: map f supportedSystems;
       attrsetsDeepMerge = (with nixpkgs.lib; foldl (a: b: attrsets.recursiveUpdate a b) { });
     in
-    forEachSystem (
-      system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ (import rust-overlay) ];
-        };
-      in
-      {
-        devShells.${system}.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [
-            (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-          ];
-        };
-      }
-    ) |> attrsetsDeepMerge;
+    attrsetsDeepMerge (
+      forEachSystem (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ (import rust-overlay) ];
+          };
+        in
+        {
+          devShells.${system}.default = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [
+              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+            ];
+          };
+        }
+      )
+    );
 }
