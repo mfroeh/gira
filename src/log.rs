@@ -54,13 +54,13 @@ pub enum ReadError {
     #[error("missing LF")]
     MissingLineFeed,
     #[error("deserialize entry from log")]
-    DeserializeEntry(#[source] serde_json::Error),
+    DeserializeEntry(#[source] bitcode::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
     #[error("serialize log entry")]
-    SerializeEntry(#[source] serde_json::Error),
+    SerializeEntry(#[source] bitcode::Error),
     #[error("invalid entry length: got: {got}, valid: {valid:?}")]
     InvalidLength {
         got: u32,
@@ -97,15 +97,15 @@ struct RecordTail {
 
 impl<K: Serialize, V: Serialize> Entry<&K, &V> {
     fn write(&self, mut w: impl Write) -> Result<(), WriteError> {
-        let payload = serde_json::to_string(self).map_err(WriteError::SerializeEntry)?;
-        let json_len = payload.len();
+        let payload = bitcode::serialize(self).map_err(WriteError::SerializeEntry)?;
+        let payload_len = payload.len();
         (1..=ENTRY_MAX_SIZE)
-            .contains(&json_len)
+            .contains(&payload_len)
             .ok_or(WriteError::InvalidLength {
-                got: json_len as u32,
+                got: payload_len as u32,
                 valid: range::RangeInclusive::from(1..=ENTRY_MAX_SIZE),
             })?;
-        let payload_checksum = crc32fast::hash(payload.as_bytes());
+        let payload_checksum = crc32fast::hash(&payload);
         let tail = RecordTail { payload_checksum };
         let payload_length = payload.len() as u32;
         let length_checksum = crc32fast::hash(&payload_length.to_le_bytes());
@@ -118,7 +118,7 @@ impl<K: Serialize, V: Serialize> Entry<&K, &V> {
             size_of::<RecordHeader>() + payload.len() + size_of::<RecordTail>() + 1,
         );
         buf.extend_from_slice(bytemuck::bytes_of(&header));
-        buf.extend_from_slice(payload.as_bytes());
+        buf.extend_from_slice(&payload);
         buf.extend_from_slice(bytemuck::bytes_of(&tail));
         buf.push(b'\n');
         w.write_all(&buf).map_err(WriteError::WriteEntry)
@@ -143,11 +143,11 @@ impl<K: DeserializeOwned, V: DeserializeOwned> Entry<K, V> {
             });
         }
 
-        let json_len = header.payload_length as usize;
+        let payload_len = header.payload_length as usize;
         (1..=ENTRY_MAX_SIZE)
-            .contains(&json_len)
+            .contains(&payload_len)
             .ok_or(ReadError::InvalidLength {
-                got: json_len as u32,
+                got: payload_len as u32,
                 valid: range::RangeInclusive::from(1..=ENTRY_MAX_SIZE),
             })?;
 
@@ -169,7 +169,7 @@ impl<K: DeserializeOwned, V: DeserializeOwned> Entry<K, V> {
             });
         }
 
-        let entry: Self = serde_json::from_slice(payload).map_err(ReadError::DeserializeEntry)?;
+        let entry: Self = bitcode::deserialize(payload).map_err(ReadError::DeserializeEntry)?;
         Ok((entry, size_of::<RecordHeader>() + buf_len))
     }
 }
@@ -343,22 +343,22 @@ mod tests {
             let mut buf = Vec::new();
             let entry = Entry::Insert("abc", 42);
             entry.as_ref().write(&mut buf).unwrap();
-            let json = serde_json::to_string(&entry).unwrap();
-            assert_eq!(buf.len(), 4 + 4 + 4 + json.len() + 4 + 1);
+            let payload = bitcode::serialize(&entry).unwrap();
+            assert_eq!(buf.len(), 4 + 4 + 4 + payload.len() + 4 + 1);
 
             assert_eq!(
                 u32::from_le_bytes(*buf[..4].as_array().unwrap()),
                 RECORD_MAGIC_NUMBER
             );
-            let want_json_length = (json.len() as u32).to_le_bytes();
-            assert_eq!(&buf[4..8], &want_json_length);
+            let want_payload_length = (payload.len() as u32).to_le_bytes();
+            assert_eq!(&buf[4..8], &want_payload_length);
             assert_eq!(
                 &buf[8..12],
-                crc32fast::hash(&want_json_length).to_le_bytes()
+                crc32fast::hash(&want_payload_length).to_le_bytes()
             );
             let got_payload_checksum =
                 u32::from_le_bytes(*buf[buf.len() - 5..buf.len() - 1].as_array().unwrap());
-            assert_eq!(crc32fast::hash(json.as_bytes()), got_payload_checksum);
+            assert_eq!(crc32fast::hash(&payload), got_payload_checksum);
             assert_eq!(buf[buf.len() - 1] as char, '\n');
         }
 
