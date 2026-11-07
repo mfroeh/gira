@@ -1,10 +1,12 @@
 use std::{
-    borrow, collections, env, fs, hash,
+    borrow, collections, env, fs,
     io::{self, Read, Write},
     path, range,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -186,27 +188,27 @@ impl<K, V> Entry<K, V> {
 
 pub(crate) fn replay_existing_log<K, V>(
     path: impl AsRef<path::Path>,
-) -> Result<collections::HashMap<K, V>, Error>
+) -> Result<collections::BTreeMap<K, Value<V>>, Error>
 where
-    K: DeserializeOwned + Eq + hash::Hash,
+    K: DeserializeOwned + Eq + Ord,
     V: DeserializeOwned,
 {
     let path = get_absolute(path.as_ref())?;
     match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => replay(file).map_err(Error::from),
         Err(err) => match err.kind() {
-            io::ErrorKind::NotFound => Ok(collections::HashMap::new()),
+            io::ErrorKind::NotFound => Ok(collections::BTreeMap::new()),
             _ => Err(Error::OpenLog(err)),
         },
     }
 }
 
-fn replay<K, V>(mut file: fs::File) -> Result<collections::HashMap<K, V>, ReadError>
+fn replay<K, V>(mut file: fs::File) -> Result<collections::BTreeMap<K, Value<V>>, ReadError>
 where
-    K: DeserializeOwned + Eq + hash::Hash,
+    K: DeserializeOwned + Eq + Ord,
     V: DeserializeOwned,
 {
-    let mut store = collections::HashMap::new();
+    let mut store = collections::BTreeMap::new();
     let len = file.metadata().map_err(ReadError::FileMetadata)?.len();
     let mut off = 0;
     while off < len {
@@ -214,8 +216,8 @@ where
             Ok((entry, read)) => {
                 off += read as u64;
                 match entry {
-                    Entry::Insert(k, v) => store.insert(k, v),
-                    Entry::Remove(k) => store.remove(&k),
+                    Entry::Insert(k, v) => store.insert(k, Value::Some(v)),
+                    Entry::Remove(k) => store.insert(k, Value::Tombstone),
                 };
             }
             Err(err) => {
@@ -266,24 +268,25 @@ pub(crate) struct Log {
 impl Log {
     pub(crate) fn open(path: impl AsRef<path::Path>) -> Result<Log, Error> {
         let path = get_absolute(path.as_ref())?;
-        let file = if !fs::exists(&path).map_err(Error::OpenLog)? {
-            let file = fs::OpenOptions::new()
-                .create(true)
+
+        let file = match fs::File::create_new(&path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
-                .map_err(Error::CreateLog)?;
-            // Ensure the file creation is flushed to disk.
-            fs::File::open(path.parent().expect("no parent"))
-                .map_err(Error::OpenParent)?
-                .sync_all()
-                .map_err(Error::SyncFailed)?;
-            file
-        } else {
-            fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .map_err(Error::OpenLog)?
-        };
+                .map_err(Error::OpenLog),
+            Ok(_) => {
+                // Ensure the file creation is flushed to disk.
+                fs::File::open(path.parent().expect("no parent"))
+                    .map_err(Error::OpenParent)?
+                    .sync_all()
+                    .map_err(Error::SyncFailed)?;
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .map_err(Error::OpenLog)
+            }
+            Err(e) => Err(Error::CreateLog(e)),
+        }?;
 
         Ok(Log {
             poisoned: false,
@@ -329,7 +332,7 @@ fn get_absolute(path: &path::Path) -> Result<borrow::Cow<'_, path::Path>, Error>
 
 #[cfg(test)]
 mod tests {
-    use std::{assert_matches, fs::File, hash_map, io::Seek};
+    use std::{assert_matches, fs::File, io::Seek};
 
     use crate::tests::open_rw_tmp_file;
 
@@ -384,7 +387,7 @@ mod tests {
         let res = replay::<String, i32>(file).unwrap();
         assert_eq!(
             res,
-            hash_map! { String::from("abc") => 42, String::from("123") => 123 },
+            map_macro::btree_map! { String::from("abc") => Value::Some(42), String::from("123") => Value::Some(123) },
             "{path:?}",
         );
     }
@@ -416,7 +419,7 @@ mod tests {
         let store = replay(file).unwrap();
         assert_eq!(
             store,
-            hash_map! { String::from("abc") => 42, String::from("123") => 123 }
+            map_macro::btree_map! { String::from("abc") => Value::Some(42), String::from("123") => Value::Some(123) }
         );
     }
 
@@ -581,7 +584,11 @@ mod tests {
             .open(&path)
             .unwrap();
         let res = replay::<String, i32>(file).unwrap();
-        assert_eq!(res, hash_map! { String::from("abc") => 42 }, "{path:?}",);
+        assert_eq!(
+            res,
+            map_macro::btree_map! { String::from("abc") => Value::Some(42) },
+            "{path:?}",
+        );
 
         // Check file truncated
         let file = File::open(&path).unwrap();
@@ -605,7 +612,11 @@ mod tests {
             .open(&path)
             .unwrap();
         let res = replay::<String, i32>(file).unwrap();
-        assert_eq!(res, hash_map! { String::from("abc") => 42 }, "{path:?}",);
+        assert_eq!(
+            res,
+            map_macro::btree_map! { String::from("abc") => Value::Some(42) },
+            "{path:?}",
+        );
 
         // Check file truncated
         let file = File::open(&path).unwrap();
@@ -634,7 +645,11 @@ mod tests {
                 .unwrap();
 
             let res = replay::<String, i32>(file).unwrap();
-            assert_eq!(res, hash_map! { String::from("abc") => 42 }, "{path:?}",);
+            assert_eq!(
+                res,
+                map_macro::btree_map! { String::from("abc") => Value::Some(42) },
+                "{path:?}",
+            );
 
             // Check file truncated
             let file = File::open(&path).unwrap();
@@ -646,7 +661,7 @@ mod tests {
             let res = replay::<String, i32>(file).unwrap();
             assert_eq!(
                 res,
-                hash_map! { String::from("abc") => 42, String::from("123") => 123 },
+                map_macro::btree_map! { String::from("abc") => Value::Some(42), String::from("123") => Value::Some(123) },
                 "{path:?}",
             );
         }
