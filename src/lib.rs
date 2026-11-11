@@ -305,11 +305,11 @@ where
         let sstables_dir = self.dir.join("sstables");
         let path = sstables_dir.join(idx.to_string());
         let res = sstable::flush(&tmp_path, &path, &self.map)
-            .and(
+            .and_then(|_| {
                 sync_directory(&sstables_dir)
-                    .map_err(|e| err!("io", &path, e, "fsync {}", sstables_dir.display())),
-            )
-            .and(SSTable::open(path.clone(), idx));
+                    .map_err(|e| err!("io", &path, e, "fsync {}", sstables_dir.display()))
+            })
+            .and_then(|_| SSTable::open(path.clone(), idx));
         match res {
             Ok(table) => {
                 self.map.clear();
