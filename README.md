@@ -10,11 +10,12 @@
 3. `&[u8]` the serialized value bytes
 
 ### WAL Disk Format
-`[Record; M]` where M is unbounded in principle
+`[Record; M]` where `M` is unbounded in principle
 
 ### SSTable Disk Format
-`[[Record; N] | [u64; N] | u32 | u32]` where
+`[[Record; N] | [u64; N] | u64 | u32 | u32]` where
 1. `[Record; N]` where `N = MAX_TABLE_ENTRIES + 1`
 2. `[u64; N]` the file byte offsets of each of the tuples
-3. `u32` the CRC32 of the offset bytes
-4. `u32` the CRC32 of the length bytes
+3. `u64` the number of tuples `N`
+4. `u32` the CRC32 of the offset bytes
+5. `u32` the CRC32 of the number of tuples

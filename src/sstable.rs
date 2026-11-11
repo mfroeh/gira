@@ -2,7 +2,7 @@ use std::{
     borrow::Borrow,
     collections::BTreeMap,
     fs::{self, File},
-    io::Write,
+    io::{BufWriter, Write},
     marker::PhantomData,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
@@ -153,7 +153,7 @@ pub(crate) fn open_all<K: DeserializeOwned, V: DeserializeOwned>(
             .map(|s| s.parse::<u64>())
         {
             None | Some(Err(_)) => {
-                return Err(err!("invalid_argument", &f.path(), "unexpected file name"));
+                return Err(err!("corrupted", &f.path(), "unexpected file name"));
             }
             Some(Ok(idx)) => {
                 let table = SSTable::open(f.path(), idx)?;
@@ -178,14 +178,15 @@ pub(crate) fn flush<K: Serialize, V: Serialize>(
 }
 
 fn write<K: Serialize, V: Serialize>(
-    mut file: File,
+    file: File,
     path: &Path,
     map: &BTreeMap<K, Value<V>>,
 ) -> Result<(), Error> {
+    let mut writer = BufWriter::with_capacity(8096, file);
     let mut offsets: Vec<u64> = Vec::with_capacity(map.len());
     let mut off = 0;
     for (k, v) in map.iter() {
-        let written = record::write(k, v.as_ref(), &mut file, path)?;
+        let written = record::write(k, v.as_ref(), &mut writer, path)?;
         offsets.push(off);
         off = off
             .checked_add(written)
@@ -196,18 +197,26 @@ fn write<K: Serialize, V: Serialize>(
         .into_iter()
         .flat_map(|o| o.to_le_bytes())
         .collect::<Vec<u8>>();
-    file.write_all(&offsets_bytes).map_err(Error::io(path))?;
+    writer.write_all(&offsets_bytes).map_err(Error::io(path))?;
 
     let len_bytes = (map.len() as u64).to_le_bytes();
-    file.write_all(&len_bytes).map_err(Error::io(path))?;
+    writer.write_all(&len_bytes).map_err(Error::io(path))?;
 
     // checksums
-    file.write_all(&crc32fast::hash(&offsets_bytes).to_le_bytes())
+    writer
+        .write_all(&crc32fast::hash(&offsets_bytes).to_le_bytes())
         .map_err(Error::io(path))?;
-    file.write_all(&crc32fast::hash(&len_bytes).to_le_bytes())
+    writer
+        .write_all(&crc32fast::hash(&len_bytes).to_le_bytes())
         .map_err(Error::io(path))?;
-    file.flush().map_err(Error::io(path))?;
-    sync_file(&file, false).map_err(Error::io(path))
+
+    match writer.into_inner() {
+        Err(e) => {
+            let e = e.into_error();
+            Err(err!("io", path, e))
+        }
+        Ok(file) => sync_file(&file, false).map_err(Error::io(path)),
+    }
 }
 
 #[cfg(test)]
