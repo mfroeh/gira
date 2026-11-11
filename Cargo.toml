@@ -7,6 +7,9 @@ edition = "2024"
 bitcode = { version = "0.6.9", features = ["serde"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 crc32fast = "1.5.3"
-map-macro = { version = "0.3.0", features = ["std"] }
+libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
+
+[dev-dependencies]
+map-macro = { version = "0.3.0", features = ["std"] }
