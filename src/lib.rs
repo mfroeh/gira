@@ -157,7 +157,6 @@ impl<'a, V> From<Value<&'a V>> for Return<'a, V> {
 #[derive(Debug)]
 struct Config {
     max_in_memory_entries: usize,
-    log_fsync_interval: u64,
 }
 
 #[derive(Debug)]
@@ -170,7 +169,6 @@ impl Default for StoreBuilder {
         Self {
             cfg: Config {
                 max_in_memory_entries: 1024,
-                log_fsync_interval: 32,
             },
         }
     }
@@ -191,11 +189,6 @@ impl StoreBuilder {
 
     pub fn max_in_memory_entries(mut self, new: usize) -> Self {
         self.cfg.max_in_memory_entries = new;
-        self
-    }
-
-    pub fn log_fsync_interval(mut self, new: u64) -> Self {
-        self.cfg.log_fsync_interval = new;
         self
     }
 }
@@ -232,7 +225,7 @@ where
         let mut map: BTreeMap<K, Value<V>> = BTreeMap::new();
         let log_idx = log::replay_all(&logs_dir, max_idx, &mut map)?;
         let log_path = logs_dir.join(log_idx.to_string());
-        let log = Log::open(log_path, cfg.log_fsync_interval)?;
+        let log = Log::open(log_path)?;
 
         Ok(Self {
             dir: dir_path,
@@ -316,7 +309,7 @@ where
                 self.sstables.push(table);
 
                 let new_log_path = self.dir.join("logs").join((idx + 1).to_string());
-                let log = Log::open(new_log_path, self.cfg.log_fsync_interval).map_err(|e| {
+                let log = Log::open(new_log_path).map_err(|e| {
                     self.poisoned = true;
                     err!("poisoned", &self.dir, "{e}")
                 })?;
