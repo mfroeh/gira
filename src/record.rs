@@ -68,7 +68,7 @@ pub(crate) fn write<K: Serialize, V: Serialize>(
 impl<K: DeserializeOwned, V: DeserializeOwned> Record<K, V> {
     pub(crate) fn read(file: &File, off: u64, path: &Path) -> Result<(Self, u64), Error> {
         let (header, off) = Self::read_and_validate_header(file, off, path)?;
-        let mut buf = vec![0; (header.key_len + header.value_len) as usize];
+        let mut buf = vec![0; header.key_len as usize + header.value_len as usize];
         file.read_exact_at(&mut buf, off).map_err(Error::io(path))?;
         let (key, value) = buf.split_at(header.key_len as usize);
 

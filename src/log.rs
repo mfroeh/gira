@@ -3,7 +3,7 @@ use std::{
     collections::{self, BTreeMap},
     env,
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Write},
+    io::{self, ErrorKind},
     path::{Path, PathBuf},
 };
 
@@ -34,7 +34,7 @@ where
             .map(|s| s.parse::<u64>())
         {
             None | Some(Err(_)) => {
-                return Err(err!("invalid_argument", &f.path(), "unexpected file name"));
+                return Err(err!("corrupted", &f.path(), "unexpected file name"));
             }
             Some(Ok(idx)) => {
                 if idx <= max_sstable_idx {
@@ -113,7 +113,7 @@ pub(crate) struct Log {
 }
 
 impl Log {
-    pub(crate) fn open(path: PathBuf) -> Result<Log, Error> {
+    pub(crate) fn open(path: PathBuf, _fsync_interval: u64) -> Result<Log, Error> {
         let path = get_absolute(&path).map_err(Error::io(&path))?;
 
         let file = match File::create_new(&path) {
@@ -152,15 +152,15 @@ impl Log {
             }
             Error::Corrupted { .. } | Error::Poisoned { .. } => unreachable!(),
         })?;
+
         sync_file(&self.file, false).map_err(|e| {
             self.poisoned = true;
             err!("poisoned", &self.path, "fsync: {e}")
         })
     }
 
-    pub(crate) fn flush_to_disk(&mut self) -> Result<(), Error> {
-        self.file.flush().map_err(Error::io(&self.path))?;
-        sync_file(&self.file, false).map_err(Error::io(&self.path))
+    pub(crate) fn delete(self) -> Result<(), Error> {
+        fs::remove_file(&self.path).map_err(Error::io(self.path))
     }
 }
 
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn append_replay_happy() {
         let path = unique_tmp_path();
-        let mut log = Log::open(path.clone()).unwrap();
+        let mut log = Log::open(path.clone(), 2).unwrap();
         log.append(&String::from("abc"), Value::Some(&42)).unwrap();
         log.append(&String::from("123"), Value::Some(&123)).unwrap();
 
@@ -205,7 +205,7 @@ mod tests {
     #[cfg(not(target_vendor = "apple"))]
     fn log_append_poison_on_write_failure() {
         let path = PathBuf::from("/dev/full");
-        let mut log = Log::open(path).unwrap();
+        let mut log = Log::open(path, 2).unwrap();
         assert_matches!(
             log.append(&String::from("abc"), Value::Some(&42)),
             Err(Error::IO { .. })
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn replay_type_mismatch() {
         let path = unique_tmp_path();
-        let mut log = Log::open(path.clone()).unwrap();
+        let mut log = Log::open(path.clone(), 2).unwrap();
         log.append(&String::from("abc"), Value::Some(&42)).unwrap();
         log.append(&String::from("123"), Value::Some(&123)).unwrap();
 
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn replay_first_corrupted() {
         let (file, path) = open_rw_tmp_file();
-        let mut log = Log::open(path.clone()).unwrap();
+        let mut log = Log::open(path.clone(), 2).unwrap();
         log.append(&String::from("abc"), Value::Some(&42)).unwrap();
         log.append(&String::from("123"), Value::Some(&123)).unwrap();
         file.write_all_at(&0x13371337u32.to_le_bytes(), 0).unwrap();
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn replay_second_corrupted() {
         let (file, path) = open_rw_tmp_file();
-        let mut log = Log::open(path.clone()).unwrap();
+        let mut log = Log::open(path.clone(), 2).unwrap();
         log.append(&String::from("abc"), Value::Some(&42)).unwrap();
         let second_start = file.metadata().unwrap().len();
         log.append(&String::from("123"), Value::Some(&123)).unwrap();
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn replay_second_unexpected_eof() {
         let (file, path) = open_rw_tmp_file();
-        let mut log = Log::open(path.clone()).unwrap();
+        let mut log = Log::open(path.clone(), 2).unwrap();
         log.append(&String::from("abc"), Value::Some(&42)).unwrap();
         let second_start = file.metadata().unwrap().len();
         log.append(&String::from("123"), Value::Some(&123)).unwrap();
@@ -299,7 +299,7 @@ mod tests {
             );
 
             // Appending still works as expected.
-            let mut log = Log::open(path.clone()).unwrap();
+            let mut log = Log::open(path.clone(), 2).unwrap();
             log.append(&String::from("123"), Value::Some(&123)).unwrap();
             let mut map = BTreeMap::new();
             replay::<String, i32>(File::open(&path).unwrap(), &path, &mut map).unwrap();

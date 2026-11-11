@@ -8,6 +8,7 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::ErrorKind::Interrupted;
+use std::mem;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
@@ -153,7 +154,54 @@ impl<'a, V> From<Value<&'a V>> for Return<'a, V> {
     }
 }
 
-pub struct KvStore<K, V, const MAX_TABLE_ENTRIES: usize = 1024> {
+#[derive(Debug)]
+struct Config {
+    max_in_memory_entries: usize,
+    log_fsync_interval: u64,
+}
+
+#[derive(Debug)]
+pub struct StoreBuilder {
+    cfg: Config,
+}
+
+impl Default for StoreBuilder {
+    fn default() -> Self {
+        Self {
+            cfg: Config {
+                max_in_memory_entries: 1024,
+                log_fsync_interval: 32,
+            },
+        }
+    }
+}
+
+impl StoreBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn open<K, V>(self, dir_path: impl AsRef<Path>) -> Result<Store<K, V>, Error>
+    where
+        K: Serialize + DeserializeOwned + Ord,
+        V: Serialize + DeserializeOwned,
+    {
+        Store::open(dir_path, self.cfg)
+    }
+
+    pub fn max_in_memory_entries(mut self, new: usize) -> Self {
+        self.cfg.max_in_memory_entries = new;
+        self
+    }
+
+    pub fn log_fsync_interval(mut self, new: u64) -> Self {
+        self.cfg.log_fsync_interval = new;
+        self
+    }
+}
+
+pub struct Store<K, V> {
+    cfg: Config,
     dir: PathBuf,
     map: BTreeMap<K, Value<V>>,
     log: Log,
@@ -162,12 +210,12 @@ pub struct KvStore<K, V, const MAX_TABLE_ENTRIES: usize = 1024> {
     poisoned: bool,
 }
 
-impl<K, V, const MAX_TABLE_ENTRIES: usize> KvStore<K, V, MAX_TABLE_ENTRIES>
+impl<K, V> Store<K, V>
 where
     K: Serialize + DeserializeOwned + Ord,
     V: Serialize + DeserializeOwned,
 {
-    pub fn open(dir_path: impl AsRef<Path>) -> Result<Self, Error> {
+    fn open(dir_path: impl AsRef<Path>, cfg: Config) -> Result<Self, Error> {
         let dir_path = dir_path.as_ref().to_path_buf();
 
         let sstables_dir = dir_path.join("sstables");
@@ -184,12 +232,13 @@ where
         let mut map: BTreeMap<K, Value<V>> = BTreeMap::new();
         let log_idx = log::replay_all(&logs_dir, max_idx, &mut map)?;
         let log_path = logs_dir.join(log_idx.to_string());
-        let log = Log::open(log_path.clone())?;
+        let log = Log::open(log_path, cfg.log_fsync_interval)?;
 
         Ok(Self {
             dir: dir_path,
             max_sstable_idx: max_idx,
             poisoned: false,
+            cfg,
             map,
             log,
             sstables,
@@ -206,7 +255,7 @@ where
             .insert(k, Value::from(v))
             .map(Return::from)
             .unwrap_or_default();
-        if self.map.len() > MAX_TABLE_ENTRIES {
+        if self.map.len() > self.cfg.max_in_memory_entries {
             self.flush()?;
         }
         Ok(v)
@@ -218,7 +267,7 @@ where
         }
         self.log.append::<K, V>(&k, Value::Tombstone)?;
         self.map.insert(k, Value::Tombstone);
-        if self.map.len() > MAX_TABLE_ENTRIES {
+        if self.map.len() > self.cfg.max_in_memory_entries {
             self.flush()?;
         }
         Ok(())
@@ -229,59 +278,10 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        if self.poisoned {
-            return Err(err!("poisoned", &self.dir));
-        }
         if let Some(v) = self.map.get(k) {
             return Ok(Return::from(v.as_ref()));
         }
         self.lookup_disk(k)
-    }
-}
-
-impl<K, V, const MAX_TABLE_ENTRIES: usize> KvStore<K, V, MAX_TABLE_ENTRIES>
-where
-    K: Serialize + DeserializeOwned + Ord,
-    V: Serialize + DeserializeOwned,
-{
-    fn flush(&mut self) -> Result<(), Error> {
-        let idx = self.max_sstable_idx + 1;
-        self.max_sstable_idx += 1;
-
-        let tmp_path = self.dir.join("sstables_tmp").join(idx.to_string());
-        let sstables_dir = self.dir.join("sstables");
-        let path = sstables_dir.join(idx.to_string());
-        let res = sstable::flush(&tmp_path, &path, &self.map);
-        match &res {
-            Ok(()) => {
-                sync_directory(&sstables_dir)
-                    .map_err(|e| err!("io", &path, e, "fsync {}", sstables_dir.display()))?;
-
-                self.log.flush_to_disk().map_err(|e| {
-                    self.poisoned = true;
-                    err!("poisoned", &self.dir, "{e}")
-                })?;
-
-                let new_log_path = self.dir.join("logs").join((idx + 1).to_string());
-                let log = Log::open(new_log_path).map_err(|e| {
-                    self.poisoned = true;
-                    err!("poisoned", &self.dir, "{e}")
-                })?;
-                self.log = log;
-
-                let table = SSTable::open(path, idx).map_err(|e| {
-                    self.poisoned = true;
-                    err!("poisoned", &self.dir, "{e}")
-                })?;
-
-                self.sstables.push(table);
-                self.map.clear();
-                Ok(())
-            }
-            Err(Error::InvalidArgument { .. }) => res,
-            Err(Error::IO { .. }) => Ok(()),
-            Err(Error::Corrupted { .. } | Error::Poisoned { .. }) => unreachable!(),
-        }
     }
 
     fn lookup_disk<Q>(&self, k: &Q) -> Result<Return<'_, V>, Error>
@@ -294,8 +294,50 @@ where
                 return Ok(Return::from(value));
             }
         }
-
         Ok(Return::None)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        let idx = self.max_sstable_idx + 1;
+        self.max_sstable_idx += 1;
+
+        let tmp_path = self.dir.join("sstables_tmp").join(idx.to_string());
+        let sstables_dir = self.dir.join("sstables");
+        let path = sstables_dir.join(idx.to_string());
+        let res = sstable::flush(&tmp_path, &path, &self.map)
+            .and(
+                sync_directory(&sstables_dir)
+                    .map_err(|e| err!("io", &path, e, "fsync {}", sstables_dir.display())),
+            )
+            .and(SSTable::open(path.clone(), idx));
+        match res {
+            Ok(table) => {
+                self.map.clear();
+                self.sstables.push(table);
+
+                let new_log_path = self.dir.join("logs").join((idx + 1).to_string());
+                let log = Log::open(new_log_path, self.cfg.log_fsync_interval).map_err(|e| {
+                    self.poisoned = true;
+                    err!("poisoned", &self.dir, "{e}")
+                })?;
+                let old_log = mem::replace(&mut self.log, log);
+                let _ = old_log.delete();
+                Ok(())
+            }
+            Err(err) => match err {
+                Error::InvalidArgument { .. } => {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(&tmp_path);
+                    Err(err)
+                }
+                Error::IO { .. } | Error::Corrupted { .. } => {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(&tmp_path);
+                    Ok(())
+                }
+                Error::Poisoned { .. } => unreachable!(),
+            },
+        }
     }
 }
 
@@ -314,7 +356,7 @@ pub(crate) fn sync_file(file: &File, metadata: bool) -> io::Result<()> {
         }
     };
     #[cfg(target_vendor = "apple")]
-    let fsync = |file: &File| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLSYNC) };
+    let fsync = |file: &File| unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
 
     loop {
         if fsync(file) == 0 {
@@ -369,7 +411,7 @@ mod tests {
     #[test]
     fn happy_in_memory_with_replay() {
         let path = dbg!(unique_tmp_path());
-        let mut store: KvStore<String, i32> = KvStore::open(&path).unwrap();
+        let mut store: Store<String, i32> = StoreBuilder::new().open(&path).unwrap();
         store.put(String::from("abc"), 42).unwrap();
         assert_eq!(store.get("abc").unwrap(), Return::Borrow(&42));
         store.put(String::from("123"), 123).unwrap();
@@ -383,7 +425,7 @@ mod tests {
         );
 
         // Replay from log.
-        store = KvStore::open(&path).unwrap();
+        store = StoreBuilder::new().open(&path).unwrap();
         assert_eq!(store.get("123").unwrap(), Return::Borrow(&123));
         assert_eq!(
             store.map,
@@ -402,7 +444,10 @@ mod tests {
     #[test]
     fn happy_flush_single_table() {
         let path = dbg!(unique_tmp_path());
-        let mut store: KvStore<String, i32, 4> = KvStore::open(&path).unwrap();
+        let mut store: Store<String, i32> = StoreBuilder::new()
+            .max_in_memory_entries(4)
+            .open(&path)
+            .unwrap();
         store.put(String::from("1"), 1).unwrap();
         store.put(String::from("2"), 2).unwrap();
         store.delete(String::from("2")).unwrap();
@@ -437,18 +482,20 @@ mod tests {
     #[test]
     fn happy_flush_many_tables() {
         let path = dbg!(unique_tmp_path());
-        const MAX_ENTRIES: usize = 4;
-        let mut store: KvStore<_, _, MAX_ENTRIES> = KvStore::open(&path).unwrap();
+        let mut store: Store<_, _> = StoreBuilder::new()
+            .max_in_memory_entries(4)
+            .open(&path)
+            .unwrap();
         // Force 100 flushes.
         let flushes = 100;
         for f in 1..=flushes {
-            for i in 1..=MAX_ENTRIES + 1 {
+            for i in 1..=store.cfg.max_in_memory_entries + 1 {
                 store.put(i, f * i).unwrap();
             }
         }
 
         // Lookup for any existing succeeds and matches the newest write.
-        for i in 1..=MAX_ENTRIES + 1 {
+        for i in 1..=store.cfg.max_in_memory_entries + 1 {
             assert_eq!(store.get(&i).unwrap(), Return::Owned(i * flushes));
         }
     }
@@ -456,14 +503,20 @@ mod tests {
     #[test]
     fn happy_reopen_after_flush() {
         let path = dbg!(unique_tmp_path());
-        let mut store: KvStore<String, i32, 2> = KvStore::open(&path).unwrap();
+        let mut store: Store<String, i32> = StoreBuilder::new()
+            .max_in_memory_entries(2)
+            .open(&path)
+            .unwrap();
         store.put(String::from("1"), 1).unwrap();
         store.put(String::from("2"), 2).unwrap();
         // Force flush to disk.
         store.put(String::from("3"), 3).unwrap();
         assert_eq!(store.map, map_macro::btree_map! {});
         // Reopen.
-        store = KvStore::open(&path).unwrap();
+        store = StoreBuilder::new()
+            .max_in_memory_entries(2)
+            .open(&path)
+            .unwrap();
         assert_eq!(store.map, map_macro::btree_map! {});
 
         store.put(String::from("4"), 4).unwrap();
@@ -472,7 +525,10 @@ mod tests {
         store.put(String::from("6"), 6).unwrap();
         assert_eq!(store.map, map_macro::btree_map! {});
         // Reopen.
-        store = KvStore::open(&path).unwrap();
+        store = StoreBuilder::new()
+            .max_in_memory_entries(2)
+            .open(&path)
+            .unwrap();
         assert_eq!(store.map, map_macro::btree_map! {});
 
         // Still finds all.
