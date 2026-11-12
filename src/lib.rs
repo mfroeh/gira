@@ -23,6 +23,8 @@ use log::Log;
 mod sstable;
 use sstable::SSTable;
 
+mod merge;
+
 mod record;
 
 macro_rules! err {
@@ -399,6 +401,14 @@ mod tests {
             .open(&path)
             .unwrap();
         (file, path)
+    }
+
+    pub(crate) fn make_sstable<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned>(
+        map: &BTreeMap<K, Value<V>>,
+    ) -> SSTable<K, V> {
+        let (tmp_path, path) = (unique_tmp_path(), unique_tmp_path());
+        sstable::flush(&tmp_path, &path, map).unwrap();
+        SSTable::open(path, 2).unwrap()
     }
 
     #[test]

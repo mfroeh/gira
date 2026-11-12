@@ -134,9 +134,53 @@ where
         }
         Ok(None)
     }
+}
+
+impl<K, V> SSTable<K, V> {
+    fn len(&self) -> usize {
+        self.offsets.len()
+    }
 
     fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.len() == 0
+    }
+}
+
+pub(crate) struct SSTableIter<'a, K, V> {
+    table: &'a SSTable<K, V>,
+    idx: usize,
+    _pd: PhantomData<fn() -> (K, V)>,
+}
+
+impl<K: DeserializeOwned, V: DeserializeOwned> Iterator for SSTableIter<'_, K, V> {
+    type Item = Result<Record<K, V>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.table.len() {
+            None
+        } else {
+            let off = self.table.offsets[self.idx];
+            self.idx += 1;
+            // TODO: Can do chunking on reads on file side to improve performance.
+            Some(
+                Record::<K, V>::read(&self.table.file, off, &self.table.path)
+                    .map(|(record, _)| record),
+            )
+        }
+    }
+}
+
+impl<'a, K: DeserializeOwned, V: DeserializeOwned> IntoIterator for &'a SSTable<K, V> {
+    type Item = Result<Record<K, V>, Error>;
+
+    type IntoIter = SSTableIter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SSTableIter {
+            table: self,
+            idx: 0,
+            _pd: PhantomData,
+        }
     }
 }
 
@@ -221,7 +265,11 @@ fn write<K: Serialize, V: Serialize>(
 
 #[cfg(test)]
 mod tests {
-    use crate::{record::DiskRecordHeader, tests::open_rw_tmp_file};
+    use crate::{
+        record::DiskRecordHeader,
+        sstable,
+        tests::{open_rw_tmp_file, unique_tmp_path},
+    };
 
     use super::*;
 
