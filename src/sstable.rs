@@ -1,6 +1,5 @@
 use std::{
     borrow::Borrow,
-    collections::BTreeMap,
     fs::{self, File},
     io::{BufWriter, Write},
     marker::PhantomData,
@@ -16,11 +15,12 @@ use crate::{
     sync_file,
 };
 
+#[derive(Debug)]
 pub(crate) struct SSTable<K, V> {
     pub(crate) idx: u64,
     offsets: Vec<u64>,
     file: File,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     _pd: PhantomData<fn() -> (K, V)>,
 }
 
@@ -134,9 +134,53 @@ where
         }
         Ok(None)
     }
+}
 
-    fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+impl<K, V> SSTable<K, V> {
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub(crate) struct SSTableIter<'a, K, V> {
+    table: &'a SSTable<K, V>,
+    idx: usize,
+    _pd: PhantomData<fn() -> (K, V)>,
+}
+
+impl<K: DeserializeOwned, V: DeserializeOwned> Iterator for SSTableIter<'_, K, V> {
+    type Item = Result<Record<K, V>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.table.len() {
+            None
+        } else {
+            let off = self.table.offsets[self.idx];
+            self.idx += 1;
+            // TODO: Can do chunking on reads on file side to improve performance.
+            Some(
+                Record::<K, V>::read(&self.table.file, off, &self.table.path)
+                    .map(|(record, _)| record),
+            )
+        }
+    }
+}
+
+impl<'a, K: DeserializeOwned, V: DeserializeOwned> IntoIterator for &'a SSTable<K, V> {
+    type Item = Result<Record<K, V>, Error>;
+
+    type IntoIter = SSTableIter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SSTableIter {
+            table: self,
+            idx: 0,
+            _pd: PhantomData,
+        }
     }
 }
 
@@ -165,41 +209,29 @@ pub(crate) fn open_all<K: DeserializeOwned, V: DeserializeOwned>(
     Ok(sstables)
 }
 
-pub(crate) fn flush<K: Serialize, V: Serialize>(
-    tmp_path: &Path,
-    path: &Path,
-    map: &BTreeMap<K, Value<V>>,
-) -> Result<(), Error> {
-    let file = File::create_new(tmp_path).map_err(Error::io(tmp_path))?;
-    write(file, tmp_path, map)?;
-
-    fs::rename_noreplace(tmp_path, path).map_err(Error::io(&path))?;
-    Ok(())
-}
-
-fn write<K: Serialize, V: Serialize>(
+pub(crate) fn write<K: Serialize, V: Serialize>(
     file: File,
     path: &Path,
-    map: &BTreeMap<K, Value<V>>,
+    tuples: impl Iterator<Item = Result<(K, Value<V>), Error>>,
 ) -> Result<(), Error> {
     let mut writer = BufWriter::with_capacity(8096, file);
-    let mut offsets: Vec<u64> = Vec::with_capacity(map.len());
+    let mut offsets: Vec<u64> = Vec::new();
     let mut off = 0;
-    for (k, v) in map.iter() {
-        let written = record::write(k, v.as_ref(), &mut writer, path)?;
+    for res in tuples {
+        let (k, v) = res?;
+        let written = record::write(&k, v.as_ref(), &mut writer, path)?;
         offsets.push(off);
         off = off
             .checked_add(written)
             .ok_or(err!("invalid_argument", path, "offset overflow"))?;
     }
 
+    let len_bytes = (offsets.len() as u64).to_le_bytes();
     let offsets_bytes = offsets
         .into_iter()
         .flat_map(|o| o.to_le_bytes())
         .collect::<Vec<u8>>();
     writer.write_all(&offsets_bytes).map_err(Error::io(path))?;
-
-    let len_bytes = (map.len() as u64).to_le_bytes();
     writer.write_all(&len_bytes).map_err(Error::io(path))?;
 
     // checksums
@@ -221,9 +253,17 @@ fn write<K: Serialize, V: Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::{record::DiskRecordHeader, tests::open_rw_tmp_file};
 
     use super::*;
+
+    fn map_iter<K, V>(
+        map: &BTreeMap<K, Value<V>>,
+    ) -> impl Iterator<Item = Result<(&K, Value<&V>), Error>> {
+        map.iter().map(|(k, v)| Ok((k, v.as_ref())))
+    }
 
     #[test]
     fn write_happy() {
@@ -244,7 +284,7 @@ mod tests {
         .map(|x| x as u64);
 
         let (file, path) = open_rw_tmp_file();
-        write(file, &path, &map).unwrap();
+        write(file, &path, map_iter(&map)).unwrap();
 
         let file = File::open(&path).unwrap();
         let meta = file.metadata().unwrap();
@@ -267,7 +307,7 @@ mod tests {
         };
 
         let (file, path) = open_rw_tmp_file();
-        write(file, &path, &map).unwrap();
+        write(file, &path, map_iter(&map)).unwrap();
         let table: SSTable<String, i32> = SSTable::open(path, 1).unwrap();
 
         assert_eq!(table.get_key(0).unwrap().unwrap(), String::from("123"));
@@ -290,7 +330,7 @@ mod tests {
         };
 
         let (file, path) = open_rw_tmp_file();
-        write(file, &path, &map).unwrap();
+        write(file, &path, map_iter(&map)).unwrap();
         let table: SSTable<i32, i32> = SSTable::open(path, 1).unwrap();
 
         assert_eq!(table.binary_search(&0).unwrap(), None);
