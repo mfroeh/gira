@@ -17,7 +17,7 @@ pub(crate) struct DiskRecordHeader {
     value_checksum: u32,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) struct Record<K, V> {
     pub(crate) key: K,
     pub(crate) value: Value<V>,

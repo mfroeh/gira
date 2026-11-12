@@ -85,6 +85,8 @@ macro_rules! err {
 
 pub(crate) use err;
 
+use crate::merge::merge;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{path}: IO: {error_msg}")]
@@ -314,22 +316,18 @@ where
         let dir = self.dir.join("sstables");
         let path = dir.join(idx.to_string());
 
-        let file = File::create_new(&tmp_path).map_err(Error::io(&tmp_path))?;
-        let res = sstable::write(
-            file,
-            &tmp_path,
-            self.map.iter().map(|(k, v)| Ok((k, v.as_ref()))),
-        )
-        .and_then(|_| {
+        let create_table = || -> Result<SSTable<K, V>, Error> {
+            let file = File::create_new(&tmp_path).map_err(Error::io(&tmp_path))?;
+            sstable::write(
+                file,
+                &tmp_path,
+                self.map.iter().map(|(k, v)| Ok((k, v.as_ref()))),
+            )?;
             fs::rename(&tmp_path, &path).map_err(Error::io(&path))?;
-            sync_directory(&dir).map_err(|e| err!("io", &path, e, "fsync {}", dir.display()))
-        })
-        .and_then(|_| SSTable::open(path.clone(), idx))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(&tmp_path);
-        });
-        match res {
+            sync_directory(&dir).map_err(|e| err!("io", &path, e, "fsync {}", dir.display()))?;
+            SSTable::open(path.clone(), idx)
+        };
+        match create_table() {
             Ok(table) => {
                 self.map.clear();
                 self.sstables.push_back(table);
@@ -343,8 +341,14 @@ where
                 let _ = old_log.delete();
                 Ok(())
             }
-            Err(Error::IO { .. } | Error::Corrupted { .. }) => Ok(()),
-            Err(e) => Err(e),
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(&tmp_path);
+                match err {
+                    Error::IO { .. } | Error::Corrupted { .. } => Ok(()),
+                    _ => Err(err),
+                }
+            }
         }
     }
 
@@ -352,25 +356,36 @@ where
         assert!(self.sstables.len() >= 2);
         let (older, newer) = (&self.sstables[0], &self.sstables[1]);
 
-        let tmp_path = self.dir.join("sstables_tmp").join(older.idx.to_string());
-        match merge::merge(newer, older, &tmp_path)
-            .and_then(|_| SSTable::open(newer.path.clone(), newer.idx))
-        {
-            Ok(table) => {
-                self.sstables.pop_front();
-                self.sstables[0] = table;
+        let dir = self.dir.join("sstables");
+        let tmp_path = self.dir.join("sstables_tmp").join(newer.idx.to_string());
+        let write_merged_table = || -> Result<SSTable<K, V>, Error> {
+            let file = File::create(&tmp_path).map_err(Error::io(&tmp_path))?;
+            let tuples = merge(newer, older);
+            sstable::write(file, &tmp_path, tuples)?;
+            let table: SSTable<K, V> = SSTable::open(tmp_path.clone(), newer.idx)?;
+            fs::rename(&tmp_path, &newer.path).map_err(Error::io(&newer.path))?;
+            sync_directory(&dir).map_err(Error::io(&dir))?;
+            Ok(table)
+        };
+        match write_merged_table() {
+            Ok(mut table) => {
+                let _ = fs::remove_file(self.sstables.pop_front().unwrap().path);
+                table.path = self.sstables.pop_front().unwrap().path;
+                self.sstables.push_front(table);
                 Ok(())
             }
-            Err(err) => match err {
-                // This can only happen when reading in the new table, that sits in-place of `newer`.
-                // In that case, our `newer` does not match the disk state, which is unrecoverable.
-                Error::Corrupted { .. } => {
-                    self.poisoned = true;
-                    Err(err!("poisoned", &self.dir, "{err}"))
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                match err {
+                    // Either of the input tables (which are currently loaded) or the newly written table is corrupted. Either case is unrecoverable.
+                    Error::Corrupted { .. } => {
+                        self.poisoned = true;
+                        Err(err!("poisoned", &self.dir, "{err}"))
+                    }
+                    Error::IO { .. } => Ok(()),
+                    Error::InvalidArgument { .. } | Error::Poisoned { .. } => Err(err),
                 }
-                Error::IO { .. } => Ok(()),
-                Error::InvalidArgument { .. } | Error::Poisoned { .. } => Err(err),
-            },
+            }
         }
     }
 }
@@ -408,7 +423,10 @@ pub(crate) fn sync_file(file: &File, metadata: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        assert_matches, env, fs, path,
+        assert_matches, env,
+        fs::{self, OpenOptions},
+        os::unix::fs::FileExt,
+        path,
         sync::atomic::{AtomicU64, Ordering},
         time::SystemTime,
     };
@@ -625,33 +643,96 @@ mod tests {
             }
         ]));
 
-        // Force another flush, which should not yet result in a compaction of the oldest two tables.
+        // Force another flush, which should result in a compaction of the oldest two tables.
         for i in 1..=store.cfg.max_in_memory_entries + 1 {
             store.put(i * 3, i * 3).unwrap();
         }
         assert_eq!(store.sstables.len(), 4);
-        assert!(store.sstables[0].into_iter().map(Result::unwrap).eq([
+        let expected_records_after_compaction = [
             Record {
                 key: 1,
-                value: Value::Some(1)
+                value: Value::Some(1),
             },
             // Note that the older record for two was replaced by the newer entry.
             Record {
                 key: 2,
-                value: Value::Some(4)
+                value: Value::Some(4),
             },
             Record {
                 key: 3,
-                value: Value::Some(1)
+                value: Value::Some(1),
             },
             Record {
                 key: 4,
-                value: Value::Some(4)
+                value: Value::Some(4),
             },
             Record {
                 key: 6,
-                value: Value::Some(4)
+                value: Value::Some(4),
             },
-        ]));
+        ];
+        assert!(
+            store.sstables[0]
+                .into_iter()
+                .map(Result::unwrap)
+                .eq(expected_records_after_compaction)
+        );
+
+        store = StoreBuilder::new()
+            .max_in_memory_entries(2)
+            .compaction_threshold(4)
+            .open(&path)
+            .unwrap();
+        // Compaction is durable.
+        assert_eq!(store.sstables.len(), 4);
+        assert!(
+            store.sstables[0]
+                .into_iter()
+                .map(Result::unwrap)
+                .eq(expected_records_after_compaction)
+        );
+        // And visible from the store.
+        assert_matches!(store.get(&1).unwrap(), Return::Owned(1));
+        assert_matches!(store.get(&2).unwrap(), Return::Owned(4));
+
+        // This is from the original table[2].
+        assert_matches!(store.get(&3).unwrap(), Return::Owned(3));
+        // This is from the original table[3].
+        assert_matches!(store.get(&4).unwrap(), Return::Owned(16));
+        // This is from the original table[5]
+        assert_matches!(store.get(&6).unwrap(), Return::Owned(6));
+
+        // Compact many.
+        for f in 1..=100 {
+            for i in 1..=store.cfg.max_in_memory_entries + 1 {
+                store.put(i * f as usize, (f as usize).pow(2)).unwrap();
+            }
+            assert_eq!(store.sstables.len(), 4);
+        }
+    }
+
+    #[test]
+    fn compact_poison_on_corruption() {
+        let path = dbg!(unique_tmp_path());
+        let mut store: Store<_, _> = StoreBuilder::new()
+            .max_in_memory_entries(0)
+            .compaction_threshold(2)
+            .open(&path)
+            .unwrap();
+
+        // Force 2 flushes, which should not yet result in a compaction.
+        store.put(1, 2).unwrap();
+        store.put(2, 4).unwrap();
+        assert_eq!(store.sstables.len(), 2);
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&store.sstables[0].path)
+            .unwrap();
+        file.write_at(&0x13371337u32.to_le_bytes(), 0).unwrap();
+
+        // Force another flush, which should result in a compaction of the oldest two tables, which will show a corruption when reading the oldest table and poison the store.
+        assert_matches!(store.put(3, 6), Err(Error::Poisoned { .. }));
+        assert!(store.poisoned);
     }
 }
