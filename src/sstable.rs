@@ -15,6 +15,7 @@ use crate::{
     sync_file,
 };
 
+#[derive(Debug)]
 pub(crate) struct SSTable<K, V> {
     pub(crate) idx: u64,
     offsets: Vec<u64>,

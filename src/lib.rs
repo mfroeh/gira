@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
+use std::fs::TryLockError;
 use std::io;
+use std::io::ErrorKind::AlreadyExists;
 use std::io::ErrorKind::Interrupted;
 use std::mem;
 use std::os::fd::AsRawFd;
@@ -205,9 +207,11 @@ impl StoreBuilder {
     }
 }
 
+#[derive(Debug)]
 pub struct Store<K, V> {
-    cfg: Config,
+    _lock: File,
     dir: PathBuf,
+    cfg: Config,
     map: BTreeMap<K, Value<V>>,
     log: Log,
     sstables: VecDeque<SSTable<K, V>>,
@@ -221,17 +225,37 @@ where
     V: Serialize + DeserializeOwned,
 {
     fn open(dir_path: impl AsRef<Path>, cfg: Config) -> Result<Self, Error> {
-        let dir_path = dir_path.as_ref().to_path_buf();
+        let dir = dir_path.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).map_err(Error::io(&dir))?;
 
-        let sstables_dir = dir_path.join("sstables");
+        let lock_path = dir.join("lock");
+        let lock = match File::create_new(&lock_path) {
+            Err(e) if e.kind() == AlreadyExists => File::open(&lock_path),
+            res => res,
+        }
+        .map_err(Error::io(&lock_path))?;
+
+        lock.try_lock().map_err(|e| match e {
+            TryLockError::Error(e) => err!("io", &lock_path, e),
+            TryLockError::WouldBlock => {
+                err!(
+                    "invalid_argument",
+                    &lock_path,
+                    "{} already open",
+                    dir.display()
+                )
+            }
+        })?;
+
+        let sstables_dir = dir.join("sstables");
         fs::create_dir_all(&sstables_dir).map_err(Error::io(&sstables_dir))?;
         let sstables = sstable::open_all(&sstables_dir)?;
         let max_idx = sstables.last().map(|t| t.idx).unwrap_or_default();
 
-        let sstables_tmp_dir = dir_path.join("sstables_tmp");
+        let sstables_tmp_dir = dir.join("sstables_tmp");
         fs::create_dir_all(&sstables_tmp_dir).map_err(Error::io(sstables_tmp_dir))?;
 
-        let logs_dir = dir_path.join("logs");
+        let logs_dir = dir.join("logs");
         fs::create_dir_all(&logs_dir).map_err(Error::io(&logs_dir))?;
 
         let mut map: BTreeMap<K, Value<V>> = BTreeMap::new();
@@ -240,10 +264,11 @@ where
         let log = Log::open(log_path)?;
 
         Ok(Self {
-            dir: dir_path,
             max_sstable_idx: max_idx,
             poisoned: false,
             sstables: VecDeque::from(sstables),
+            dir,
+            _lock: lock,
             cfg,
             map,
             log,
@@ -471,6 +496,16 @@ mod tests {
     }
 
     #[test]
+    fn open_enforce_exclusive_dir() {
+        let path = dbg!(unique_tmp_path());
+        let _store1: Store<i32, i32> = StoreBuilder::new().open(&path).unwrap();
+        assert_matches!(
+            StoreBuilder::new().open::<i32, i32>(&path),
+            Err(Error::InvalidArgument { .. })
+        )
+    }
+
+    #[test]
     fn happy_in_memory_with_replay() {
         let path = dbg!(unique_tmp_path());
         let mut store: Store<String, i32> = StoreBuilder::new().open(&path).unwrap();
@@ -487,6 +522,7 @@ mod tests {
         );
 
         // Replay from log.
+        drop(store);
         store = StoreBuilder::new().open(&path).unwrap();
         assert_eq!(store.get("123").unwrap(), Return::Borrow(&123));
         assert_eq!(
@@ -575,6 +611,7 @@ mod tests {
         store.put(String::from("3"), 3).unwrap();
         assert_eq!(store.map, map_macro::btree_map! {});
         // Reopen.
+        drop(store);
         store = StoreBuilder::new()
             .max_in_memory_entries(2)
             .open(&path)
@@ -587,6 +624,7 @@ mod tests {
         store.put(String::from("6"), 6).unwrap();
         assert_eq!(store.map, map_macro::btree_map! {});
         // Reopen.
+        drop(store);
         store = StoreBuilder::new()
             .max_in_memory_entries(2)
             .open(&path)
@@ -678,6 +716,7 @@ mod tests {
                 .eq(expected_records_after_compaction)
         );
 
+        drop(store);
         store = StoreBuilder::new()
             .max_in_memory_entries(2)
             .compaction_threshold(4)
