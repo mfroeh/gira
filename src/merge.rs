@@ -1,11 +1,15 @@
-use std::iter::Peekable;
+use std::{
+    fs::{self, File},
+    iter::Peekable,
+    path::Path,
+};
 
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     Error,
     record::Record,
-    sstable::{SSTable, SSTableIter},
+    sstable::{self, SSTable, SSTableIter},
 };
 
 struct MergeIter<'a, 'b, K: DeserializeOwned, V: DeserializeOwned> {
@@ -40,28 +44,43 @@ impl<K: DeserializeOwned + Ord, V: DeserializeOwned> Iterator for MergeIter<'_, 
 pub(crate) fn merge<K, V>(
     newer: &SSTable<K, V>,
     older: &SSTable<K, V>,
-) -> impl Iterator<Item = Result<Record<K, V>, Error>>
+    tmp_path: &Path,
+) -> Result<(), Error>
 where
-    K: DeserializeOwned + Ord,
-    V: DeserializeOwned,
+    K: DeserializeOwned + Serialize + Ord,
+    V: DeserializeOwned + Serialize,
 {
-    MergeIter {
+    let iter = MergeIter {
         newer: newer.into_iter().peekable(),
         older: older.into_iter().peekable(),
-    }
+    };
+    let tuples = iter.map(|res| res.map(|res| (res.key, res.value)));
+
+    let file = File::create(&tmp_path).map_err(Error::io(&tmp_path))?;
+    sstable::write(file, &tmp_path, tuples).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        e
+    })?;
+
+    fs::rename(&tmp_path, &newer.path).map_err(Error::io(tmp_path))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use map_macro::btree_map;
 
-    use crate::{Value, tests::make_sstable};
+    use crate::{
+        Value,
+        tests::{make_sstable, unique_tmp_path},
+    };
 
     use super::*;
 
     #[test]
     // TODO: good candidate for prop test
-    fn merge_happy() {
+    fn merge_iter_happy() {
         let new = btree_map! {
             // New only
              1 => Value::Some(1),
@@ -122,9 +141,33 @@ mod tests {
                 value: Value::Tombstone,
             },
         ];
-        let new = make_sstable(&new);
-        let old = make_sstable(&old);
+        let (new, _) = make_sstable(&new);
+        let (old, _) = make_sstable(&old);
 
-        assert!(merge(&new, &old).map(Result::unwrap).eq(expected));
+        let iter = MergeIter {
+            newer: new.into_iter().peekable(),
+            older: old.into_iter().peekable(),
+        };
+        assert!(iter.map(Result::unwrap).eq(expected));
+    }
+
+    #[test]
+    fn merge_happy() {
+        let new = btree_map! {
+            // New only
+             1 => Value::Some(1),
+        };
+        let old = btree_map! {
+            // Old only
+             -1 => Value::Some(-1),
+        };
+        let (new, new_path) = make_sstable(&new);
+        let (old, _) = make_sstable(&old);
+        merge(&new, &old, &unique_tmp_path()).unwrap();
+
+        let table: SSTable<i32, i32> = SSTable::open(new_path, new.idx).unwrap();
+        assert_eq!(table.len(), 2);
+        assert_matches!(table.get_value(0), Ok(Some(Value::Some(-1))));
+        assert_matches!(table.get_value(1), Ok(Some(Value::Some(1))));
     }
 }

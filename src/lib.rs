@@ -1,9 +1,9 @@
-#![feature(rename_noreplace)]
 #[cfg(not(unix))]
 const _: () = compile_error!("this is a UNIX only crate");
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -159,6 +159,7 @@ impl<'a, V> From<Value<&'a V>> for Return<'a, V> {
 #[derive(Debug)]
 struct Config {
     max_in_memory_entries: usize,
+    compaction_threshold: u64,
 }
 
 #[derive(Debug)]
@@ -171,6 +172,7 @@ impl Default for StoreBuilder {
         Self {
             cfg: Config {
                 max_in_memory_entries: 1024,
+                compaction_threshold: 4,
             },
         }
     }
@@ -193,6 +195,12 @@ impl StoreBuilder {
         self.cfg.max_in_memory_entries = new;
         self
     }
+
+    pub fn compaction_threshold(mut self, new: u64) -> Self {
+        assert!(2 <= new);
+        self.cfg.compaction_threshold = new;
+        self
+    }
 }
 
 pub struct Store<K, V> {
@@ -200,7 +208,7 @@ pub struct Store<K, V> {
     dir: PathBuf,
     map: BTreeMap<K, Value<V>>,
     log: Log,
-    sstables: Vec<SSTable<K, V>>,
+    sstables: VecDeque<SSTable<K, V>>,
     max_sstable_idx: u64,
     poisoned: bool,
 }
@@ -233,10 +241,10 @@ where
             dir: dir_path,
             max_sstable_idx: max_idx,
             poisoned: false,
+            sstables: VecDeque::from(sstables),
             cfg,
             map,
             log,
-            sstables,
         })
     }
 
@@ -252,6 +260,9 @@ where
             .unwrap_or_default();
         if self.map.len() > self.cfg.max_in_memory_entries {
             self.flush()?;
+            if self.sstables.len() as u64 > self.cfg.compaction_threshold {
+                self.compact()?;
+            }
         }
         Ok(v)
     }
@@ -264,6 +275,9 @@ where
         self.map.insert(k, Value::Tombstone);
         if self.map.len() > self.cfg.max_in_memory_entries {
             self.flush()?;
+            if self.sstables.len() as u64 > self.cfg.compaction_threshold {
+                self.compact()?;
+            }
         }
         Ok(())
     }
@@ -297,18 +311,28 @@ where
         self.max_sstable_idx += 1;
 
         let tmp_path = self.dir.join("sstables_tmp").join(idx.to_string());
-        let sstables_dir = self.dir.join("sstables");
-        let path = sstables_dir.join(idx.to_string());
-        let res = sstable::flush(&tmp_path, &path, &self.map)
-            .and_then(|_| {
-                sync_directory(&sstables_dir)
-                    .map_err(|e| err!("io", &path, e, "fsync {}", sstables_dir.display()))
-            })
-            .and_then(|_| SSTable::open(path.clone(), idx));
+        let dir = self.dir.join("sstables");
+        let path = dir.join(idx.to_string());
+
+        let file = File::create_new(&tmp_path).map_err(Error::io(&tmp_path))?;
+        let res = sstable::write(
+            file,
+            &tmp_path,
+            self.map.iter().map(|(k, v)| Ok((k, v.as_ref()))),
+        )
+        .and_then(|_| {
+            fs::rename(&tmp_path, &path).map_err(Error::io(&path))?;
+            sync_directory(&dir).map_err(|e| err!("io", &path, e, "fsync {}", dir.display()))
+        })
+        .and_then(|_| SSTable::open(path.clone(), idx))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(&tmp_path);
+        });
         match res {
             Ok(table) => {
                 self.map.clear();
-                self.sstables.push(table);
+                self.sstables.push_back(table);
 
                 let new_log_path = self.dir.join("logs").join((idx + 1).to_string());
                 let log = Log::open(new_log_path).map_err(|e| {
@@ -319,18 +343,33 @@ where
                 let _ = old_log.delete();
                 Ok(())
             }
+            Err(Error::IO { .. } | Error::Corrupted { .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn compact(&mut self) -> Result<(), Error> {
+        assert!(self.sstables.len() >= 2);
+        let (older, newer) = (&self.sstables[0], &self.sstables[1]);
+
+        let tmp_path = self.dir.join("sstables_tmp").join(older.idx.to_string());
+        match merge::merge(newer, older, &tmp_path)
+            .and_then(|_| SSTable::open(newer.path.clone(), newer.idx))
+        {
+            Ok(table) => {
+                self.sstables.pop_front();
+                self.sstables[0] = table;
+                Ok(())
+            }
             Err(err) => match err {
-                Error::InvalidArgument { .. } => {
-                    let _ = fs::remove_file(&path);
-                    let _ = fs::remove_file(&tmp_path);
-                    Err(err)
+                // This can only happen when reading in the new table, that sits in-place of `newer`.
+                // In that case, our `newer` does not match the disk state, which is unrecoverable.
+                Error::Corrupted { .. } => {
+                    self.poisoned = true;
+                    Err(err!("poisoned", &self.dir, "{err}"))
                 }
-                Error::IO { .. } | Error::Corrupted { .. } => {
-                    let _ = fs::remove_file(&path);
-                    let _ = fs::remove_file(&tmp_path);
-                    Ok(())
-                }
-                Error::Poisoned { .. } => unreachable!(),
+                Error::IO { .. } => Ok(()),
+                Error::InvalidArgument { .. } | Error::Poisoned { .. } => Err(err),
             },
         }
     }
@@ -369,10 +408,12 @@ pub(crate) fn sync_file(file: &File, metadata: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        assert_matches, env, fs,
+        assert_matches, env, fs, path,
         sync::atomic::{AtomicU64, Ordering},
         time::SystemTime,
     };
+
+    use crate::record::Record;
 
     use super::*;
 
@@ -405,10 +446,10 @@ mod tests {
 
     pub(crate) fn make_sstable<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned>(
         map: &BTreeMap<K, Value<V>>,
-    ) -> SSTable<K, V> {
-        let (tmp_path, path) = (unique_tmp_path(), unique_tmp_path());
-        sstable::flush(&tmp_path, &path, map).unwrap();
-        SSTable::open(path, 2).unwrap()
+    ) -> (SSTable<K, V>, path::PathBuf) {
+        let (file, path) = open_rw_tmp_file();
+        sstable::write(file, &path, map.iter().map(|(k, v)| Ok((k, v.as_ref())))).unwrap();
+        (SSTable::open(path.clone(), 2).unwrap(), path.to_path_buf())
     }
 
     #[test]
@@ -538,5 +579,79 @@ mod tests {
         for i in 1..=6 {
             assert_eq!(store.get(&i.to_string()).unwrap(), Return::Owned(i));
         }
+    }
+
+    #[test]
+    fn compact_happy() {
+        let path = dbg!(unique_tmp_path());
+        let mut store: Store<_, _> = StoreBuilder::new()
+            .max_in_memory_entries(2)
+            .compaction_threshold(4)
+            .open(&path)
+            .unwrap();
+
+        // Force 4 flushes, which should not yet result in a compaction.
+        for f in 1..=store.cfg.compaction_threshold {
+            for i in 1..=store.cfg.max_in_memory_entries + 1 {
+                store.put(i * f as usize, (f as usize).pow(2)).unwrap();
+            }
+        }
+        assert!(store.sstables[0].into_iter().map(Result::unwrap).eq([
+            Record {
+                key: 1,
+                value: Value::Some(1)
+            },
+            Record {
+                key: 2,
+                value: Value::Some(1)
+            },
+            Record {
+                key: 3,
+                value: Value::Some(1)
+            }
+        ]));
+        assert!(store.sstables[1].into_iter().map(Result::unwrap).eq([
+            Record {
+                key: 2,
+                value: Value::Some(4)
+            },
+            Record {
+                key: 4,
+                value: Value::Some(4)
+            },
+            Record {
+                key: 6,
+                value: Value::Some(4)
+            }
+        ]));
+
+        // Force another flush, which should not yet result in a compaction of the oldest two tables.
+        for i in 1..=store.cfg.max_in_memory_entries + 1 {
+            store.put(i * 3, i * 3).unwrap();
+        }
+        assert_eq!(store.sstables.len(), 4);
+        assert!(store.sstables[0].into_iter().map(Result::unwrap).eq([
+            Record {
+                key: 1,
+                value: Value::Some(1)
+            },
+            // Note that the older record for two was replaced by the newer entry.
+            Record {
+                key: 2,
+                value: Value::Some(4)
+            },
+            Record {
+                key: 3,
+                value: Value::Some(1)
+            },
+            Record {
+                key: 4,
+                value: Value::Some(4)
+            },
+            Record {
+                key: 6,
+                value: Value::Some(4)
+            },
+        ]));
     }
 }
