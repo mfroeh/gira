@@ -348,9 +348,11 @@ where
                 &tmp_path,
                 self.map.iter().map(|(k, v)| Ok((k, v.as_ref()))),
             )?;
+            let mut table = SSTable::open(tmp_path.clone(), idx)?;
             fs::rename(&tmp_path, &path).map_err(Error::io(&path))?;
             sync_directory(&dir).map_err(|e| err!("io", &path, e, "fsync {}", dir.display()))?;
-            SSTable::open(path.clone(), idx)
+            table.path = path.clone();
+            Ok(table)
         };
         match create_table() {
             Ok(table) => {
